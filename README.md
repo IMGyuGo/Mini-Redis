@@ -1,260 +1,168 @@
-# Mini Redis
+﻿# Mini Redis
 
-Mini Redis는 Redis의 핵심 동작을 Python으로 재구성한 미니 서버 프로젝트입니다.
-기본적인 Key-Value 저장소를 넘어 RESP 프로토콜, TCP 통신, TTL, 태그 기반 invalidation,
-AOF/RDB 스타일 persistence, 복구 정책, storage inspection과 benchmarking까지 포함해
-서버 내부 구조를 계층적으로 구현했습니다.
+Python으로 만든 학습용 Mini Redis 프로젝트입니다. 이 저장소는 단순한 key-value 저장소를 넘어서, `CLI -> TCP -> RESP -> Command Routing -> Redis Engine -> Storage / TTL / Persistence / Invalidation / Mongo` 흐름이 계층적으로 어떻게 분리되는지 보여주는 데 초점을 둡니다.
 
-## 1. Overview
+## Architecture At A Glance
 
-### 목표
+![Mini Redis Architecture](img/mini-redis-architecture.svg)
 
-- Redis의 핵심 동작을 직접 구현하며 내부 구조를 이해한다.
-- CLI, Network, Protocol, Command Routing, Engine, Storage를 분리된 계층으로 설계한다.
-- 단순 CRUD를 넘어서 TTL, persistence, recovery, diagnostics까지 포함한 서버를 만든다.
+## Request Flow In Order
 
-### 핵심 키워드
+아래 순서로 읽으면 현재 프로젝트 구조가 가장 빠르게 이해됩니다.
 
-- `Server / Client`
-- `RESP`
-- `TCP Server / Client`
-- `Command Queue`
-- `CommandManager`
-- `Storage Engine`
-- `TTL`
-- `Tag-based Invalidation`
-- `AOF / Snapshot`
-- `Recovery Policy`
-- `Incremental Rehashing`
-- `MongoDB Manager`
+1. 사용자는 `mini-redis-cli`로 명령을 입력합니다.
+2. `src/mini_redis/cli/client.py`의 `CLIClient`가 입력을 받고, 로컬 메타 명령인지 서버로 보낼 명령인지 구분합니다.
+3. `src/mini_redis/cli/parser.py`가 입력 문자열을 `{"name": "...", "args": [...]}` 형태의 공통 Command 객체로 바꿉니다.
+4. `src/mini_redis/protocol/resp.py`의 `RespCodec`가 이 명령을 RESP 바이트로 인코딩합니다.
+5. `src/mini_redis/network/tcp_client.py`의 `TCPClient`가 TCP 소켓으로 서버에 전송합니다.
+6. 서버는 `src/mini_redis/network/tcp_server.py`에서 요청을 받고, 다시 `RespCodec`으로 RESP를 Command 객체로 디코딩합니다.
+7. 모든 서버 명령은 `src/mini_redis/commands/manager.py`의 `CommandManager.execute()`로 들어갑니다.
+8. `CommandManager`는 `src/mini_redis/commands/queue.py`의 FIFO `CommandQueue`를 통해 동시 요청 실행 순서를 직렬화합니다.
+9. 그다음 명령 이름에 맞는 handler가 선택되고, 각 handler가 인자 검증과 명령별 로직 분기를 담당합니다.
+10. handler는 내부 오케스트레이터인 `src/mini_redis/engine/redis.py`의 `Redis` 객체를 호출합니다.
+11. `Redis`는 실제 데이터 저장과 부가 기능을 위해 Storage, TTL, Persistence, Invalidation, Mongo 매니저를 조합해 사용합니다.
+12. 결과는 다시 RESP 응답으로 인코딩되어 TCP를 통해 CLI로 돌아옵니다.
 
-## 2. Features At A Glance
+## Startup Flow
 
-| 구분 | 구현 내용 |
-| --- | --- |
-| Client UX | `mini-redis-cli`, ASCII 배너, 응답 포맷팅, timing 표시 |
-| Protocol | RESP 인코딩/디코딩, 멀티라인 프레임 처리 |
-| Network | TCP 서버/클라이언트 구현, 서버는 지속 연결 처리, 기본 CLI 클라이언트는 명령마다 새 연결 사용 |
-| Command Layer | 명령 정규화, FIFO 실행, 핸들러 기반 라우팅 |
-| Core Data | `SET`, `GET`, `MGET`, `DELETE`, `EXISTS`, `INCR`, `KEYS`, `DUMPALL` |
-| Expiration | `EXPIRE`, `TTL`, 만료 key 정리 |
-| Invalidation | `TAGS`, `INVALIDATE <tag>` |
-| Persistence | `SAVE`, `LOAD`, `BGSAVE`, `REWRITEAOF`, `BGREWRITEAOF`, `REPAIRAOF`, `FLUSHDB` |
-| Diagnostics | `INSPECT STORAGE`, `PROBE`, storage 상태/latency/rehash 진행도 관찰 |
-| Benchmark | `BENCHMARK REDIS|MONGO|HYBRID` |
-| Runtime Config | `CONFIG GET`, `CONFIG SET` |
-| Observability | `INFO PERSISTENCE`, `INFO MONGO` |
-| Testing | CLI, RESP, TCP, Storage, TTL, Persistence, Recovery, Diagnostics, Mongo 경계 테스트 |
+이 프로젝트는 실행 시점에도 구조가 깔끔하게 나뉘어 있습니다.
 
-## 3. Distinctive Features
+### Server startup
 
-이 프로젝트의 특징은 Redis 명령을 흉내내는 데서 끝나지 않고, 내부 동작과 운영 상태를
-관찰할 수 있는 기능들을 함께 구현했다는 점입니다.
+1. `src/mini_redis/server_main.py`가 서버 시작점입니다.
+2. 여기서 `src/mini_redis/bootstrap.py`의 `build_command_manager()`를 호출합니다.
+3. `build_command_manager()`는 `StorageManager`, `TTLManager`, `InvalidationManager`, `PersistenceManager`, `MongoManager`를 생성합니다.
+4. 이 매니저들을 묶어 `Redis` 엔진을 만듭니다.
+5. 각 명령별 handler를 등록한 뒤 `CommandManager`를 생성합니다.
+6. 마지막으로 `TCPServer`가 `CommandManager`와 `RespCodec`을 받아 요청 처리를 시작합니다.
 
-| 기능 | 설명 |
-| --- | --- |
-| Tag-based Invalidation | `SET ... TAGS ...` 와 `INVALIDATE <tag>` 로 관련 key를 묶어서 제거할 수 있습니다. |
-| Observable Persistence | `INFO PERSISTENCE` 로 snapshot, AOF, metadata, background task 상태를 확인할 수 있습니다. |
-| Recovery Policies | `best-effort`, `snapshot-first`, `aof-only`, `strict` 복구 정책을 지원합니다. |
-| Repairable AOF | `REPAIRAOF` 로 손상된 AOF tail을 복구할 수 있습니다. |
-| FIFO Command Queue | `CommandManager`가 동시 요청을 FIFO 순서로 직렬 실행합니다. |
-| Incremental Rehash Storage | 내부 해시 테이블이 incremental rehashing 방식으로 동작합니다. |
-| Storage Inspection | `INSPECT STORAGE`, `PROBE` 로 rehash 진행도와 요청 latency를 관찰할 수 있습니다. |
-| Benchmark Modes | `BENCHMARK REDIS`, `BENCHMARK MONGO`, `BENCHMARK HYBRID` 로 백엔드별 쓰기 비용을 비교할 수 있습니다. |
-| Debug-friendly Dump | `DUMPALL` 이 key, value, ttl, tags를 함께 보여줍니다. |
-| CLI Local Helpers | `.help`, `.demo`, `.clear`, `.exit`, `WATCH`, `LIVESET` 같은 로컬 helper를 제공합니다. |
+### Client startup
 
-## 4. Architecture
+1. `src/mini_redis/cli_main.py`가 클라이언트 시작점입니다.
+2. `RespCodec`, `TCPClient`, `CLIClient`를 조립합니다.
+3. `CLIClient.run()`이 인터랙티브 세션을 시작합니다.
 
-![Mini Redis Architecture](docs/architecture.png)
-
-## 5. Presentation Materials
-
-### 5-1. 서버 - 클라이언트
-
-- 클라이언트는 사용자의 명령을 입력받아 RESP 형식으로 인코딩한 뒤 TCP로 서버에 전송합니다.
-- 서버는 RESP 요청을 해석하고 `CommandManager`에 전달한 뒤, 실행 결과를 다시 RESP 응답으로 반환합니다.
-- 네트워크 계층은 transport 역할만 담당하고, 실제 명령 실행은 상위 계층에 위임합니다.
-
-### 5-2. 커맨드 큐
-
-- 여러 요청이 동시에 들어와도 `CommandQueue`가 모든 명령을 FIFO 순서로 직렬 실행합니다.
-- storage, ttl, invalidation, persistence 같은 공유 상태를 안전하게 관리하기 위한 구조입니다.
-- throughput보다 데이터 정합성과 예측 가능한 실행 순서를 우선합니다.
-
-### 5-3. 커맨드 매니저
-
-- `CommandManager`는 서버 명령의 단일 진입점입니다.
-- 들어온 명령을 정규화하고 적절한 handler로 라우팅합니다.
-- 모든 명령이 동일한 경로를 통과하기 때문에 테스트, 디버깅, 로깅, 복구 흐름을 일관되게 유지할 수 있습니다.
-
-### 5-4. Storage Engine (Hash Table, Incremental Rehashing)
-
-- 메인 저장소는 in-memory hash table 기반의 key-value store입니다.
-- load factor가 임계치를 넘으면 더 큰 테이블을 만들고, 각 요청마다 bucket을 조금씩 옮기는 incremental rehashing으로 확장합니다.
-- resize 비용을 한 번에 몰지 않고 분산시켜 응답 지연을 줄이는 것이 핵심입니다.
-- `INSPECT STORAGE`, `PROBE` 를 통해 rehash 진행 상태와 latency를 관찰할 수 있습니다.
-
-### 5-5. TTL Manager
-
-- key의 만료 시각을 별도 구조로 관리합니다.
-- `EXPIRE` 로 TTL을 설정하고 `TTL` 로 남은 시간을 조회합니다.
-- 조회 전에 만료 여부를 확인해 expired key를 자동 정리합니다.
-- 값 저장과 만료 정책을 분리해 책임을 명확하게 나눴습니다.
-
-### 5-6. Invalidation Manager
-
-- tag 기반 secondary index를 관리합니다.
-- `SET ... TAGS ...` 로 key와 tag를 연결하고, `INVALIDATE <tag>` 로 관련 key를 한 번에 제거합니다.
-- key 삭제, 만료, 복구 시 tag index도 함께 정리해 stale reference를 방지합니다.
-- 여러 key를 하나의 그룹처럼 관리할 수 있도록 만든 캐시 무효화 계층입니다.
-
-### 5-7. Persistence Manager
-
-- 메모리 상태를 파일로 저장하고 재시작 후 복구하는 계층입니다.
-- AOF는 명령 로그를 순차적으로 기록하고, snapshot은 현재 상태를 한 번에 저장합니다.
-- 부팅 시 recovery policy에 따라 snapshot을 복원하고, snapshot 이후의 AOF tail을 replay합니다.
-- `SAVE`, `BGSAVE`, `REWRITEAOF`, `REPAIRAOF`, `INFO PERSISTENCE` 등으로 persistence 상태를 관리합니다.
-
-### 5-8. MongoDB Manager
-
-- MongoDB 연동을 위한 확장 경계 계층입니다.
-- 연결 정보, upsert/delete/clear, `INFO MONGO`, `BENCHMARK MONGO`, `BENCHMARK HYBRID` 를 제공합니다.
-- 현재는 기본 Redis 명령 경로에서 자동 write-through 하지는 않으며, 외부 저장소 확장 포인트로 설계되어 있습니다.
-
-## 6. Usage Examples
-
-### 기본 명령
+## Directory Map
 
 ```text
-PING
-SET user:1 hello
-GET user:1
-INCR visits
-MGET user:1 visits missing:key
+miniRedis/
+|-- img/
+|   `-- mini-redis-architecture.svg   # README architecture image
+|-- data/                             # runtime persistence files
+|-- docs/                             # extra docs / legacy assets
+|-- src/
+|   `-- mini_redis/
+|       |-- cli_main.py               # CLI entrypoint
+|       |-- server_main.py            # server entrypoint
+|       |-- bootstrap.py              # dependency wiring
+|       |-- config.py                 # runtime settings
+|       |-- types.py                  # shared Command type
+|       |-- cli/
+|       |   |-- client.py             # terminal UX
+|       |   `-- parser.py             # CLI string -> Command
+|       |-- protocol/
+|       |   `-- resp.py               # RESP encode/decode
+|       |-- network/
+|       |   |-- tcp_client.py         # client transport
+|       |   |-- tcp_server.py         # server transport
+|       |   `-- timing.py             # timed request/response wrapper
+|       |-- commands/
+|       |   |-- manager.py            # single execution entrypoint
+|       |   |-- queue.py              # FIFO serialization
+|       |   |-- catalog.py            # HELP metadata
+|       |   `-- handlers/             # one file per command family
+|       |-- engine/
+|       |   `-- redis.py              # internal orchestrator
+|       |-- storage/
+|       |   |-- manager.py            # in-memory hash table
+|       |   |-- ttl.py                # expiration tracking
+|       |   |-- mongo_adapter.py      # pymongo boundary
+|       |   |-- mongo_manager.py      # mongo policy / info
+|       |   `-- benchmark.py          # benchmark helpers
+|       |-- invalidation/
+|       |   `-- manager.py            # tag index
+|       `-- persistence/
+|           |-- manager.py            # persistence coordinator
+|           |-- aof.py                # append-only log
+|           |-- rdb.py                # snapshot store
+|           `-- meta.py               # metadata store
+`-- tests/                            # CLI / RESP / TCP / command / storage tests
 ```
 
-### TTL + Tags
+## What Each Layer Owns
 
-```text
-SET user:1:profile profile TAGS user:1 demo
-SET user:1:session live EX 30 TAGS user:1 demo
-TTL user:1:session
-DUMPALL
-```
+### 1. CLI layer
 
-### Storage Inspection
+- 책임: 입력, 출력, 프롬프트, 로컬 편의 명령 처리
+- 핵심 파일: `src/mini_redis/cli/client.py`, `src/mini_redis/cli/parser.py`
+- 하지 않는 일: 직접 Redis 엔진 호출, 직접 파일 저장
 
-```text
-FLUSHDB
-INSPECT STORAGE RESET
-INSPECT STORAGE RUN 20
-INSPECT STORAGE
-INSPECT STORAGE UPDATE 20
-INSPECT STORAGE FULL
-```
+### 2. Protocol layer
 
-### Single Request Probe
+- 책임: RESP 인코딩/디코딩
+- 핵심 파일: `src/mini_redis/protocol/resp.py`
+- 하지 않는 일: 비즈니스 로직 처리
 
-```text
-PROBE SET demo:key hello
-PROBE UPDATE demo:key hello-again
-```
+### 3. Network layer
 
-### Benchmark
+- 책임: TCP 연결 생성, 요청 수신/응답 전달
+- 핵심 파일: `src/mini_redis/network/tcp_client.py`, `src/mini_redis/network/tcp_server.py`
+- 하지 않는 일: 명령 해석, storage 접근
 
-```text
-BENCHMARK REDIS 1000 KEEP
-BENCHMARK MONGO 1000
-BENCHMARK HYBRID 1000
-```
+### 4. Command layer
 
-### Persistence
+- 책임: 명령 진입점 통일, FIFO 실행, handler 라우팅
+- 핵심 파일: `src/mini_redis/commands/manager.py`, `src/mini_redis/commands/queue.py`, `src/mini_redis/commands/handlers/`
+- 핵심 포인트: 서버 쪽 명령 실행은 항상 `CommandManager`를 통과합니다.
 
-```text
-SAVE
-INFO PERSISTENCE
-CONFIG SET autorewrite_min_operations 1
-SET auto:key value
-INFO PERSISTENCE
-```
+### 5. Engine layer
 
-## 7. Supported Server Commands
+- 책임: 여러 내부 매니저를 묶어서 한 번의 명령을 완성
+- 핵심 파일: `src/mini_redis/engine/redis.py`
+- 핵심 포인트: `Redis`는 저장, TTL, persistence, invalidation, mongo를 조합하는 오케스트레이터입니다.
 
-```text
-PING
-HELP [command]
-SET <key> <value> [EX <seconds>] [TAGS <tag> ...]
-GET <key>
-MGET <key> [key ...]
-DELETE <key>
-EXISTS <key>
-INCR <key>
-KEYS
-DUMPALL
-EXPIRE <key> <seconds>
-TTL <key>
-INVALIDATE <tag>
-INSPECT STORAGE
-INSPECT STORAGE FULL
-INSPECT STORAGE RESET
-INSPECT STORAGE RUN <count>
-INSPECT STORAGE UPDATE <count>
-PROBE SET <key> <value>
-PROBE UPDATE <key> <value>
-BENCHMARK REDIS|MONGO|HYBRID <count> [KEEP]
-SAVE
-BGSAVE
-LOAD
-REWRITEAOF
-BGREWRITEAOF
-REPAIRAOF
-FLUSHDB
-INFO PERSISTENCE
-INFO MONGO
-CONFIG GET <key>
-CONFIG SET <key> <value>
-QUIT
-```
+### 6. Data/manager layer
 
-## 8. CLI Local Commands
+- `StorageManager`: 메모리 해시 테이블과 incremental rehashing
+- `TTLManager`: 만료 시각 추적과 expired key 정리
+- `InvalidationManager`: tag -> keys, key -> tags 인덱스 관리
+- `PersistenceManager`: AOF, snapshot, recovery, background task 조정
+- `MongoManager`: Mongo 연동 여부와 쓰기 시간 측정, adapter 호출
 
-다음 명령은 서버로 보내지지 않고 CLI 내부에서 처리됩니다.
+## The Most Important Files First
 
-| Command | Description |
-| --- | --- |
-| `.help` | 로컬 helper 목록을 출력합니다. |
-| `.demo` | 추천 시연 시퀀스를 출력합니다. |
-| `.clear` | 화면을 정리합니다. |
-| `.exit` | 서버에 `QUIT`를 보내지 않고 CLI만 종료합니다. |
-| `WATCH <interval> <count> <command...>` | 중첩 명령을 주기적으로 반복 실행합니다. |
-| `LIVESET <count> [interval] [key_prefix]` | 연속적인 `PROBE SET` 요청을 자동 생성합니다. |
+처음 읽을 때는 아래 순서를 추천합니다.
 
-## 9. Testing
+1. `src/mini_redis/cli_main.py`
+2. `src/mini_redis/server_main.py`
+3. `src/mini_redis/bootstrap.py`
+4. `src/mini_redis/network/tcp_server.py`
+5. `src/mini_redis/commands/manager.py`
+6. `src/mini_redis/commands/queue.py`
+7. `src/mini_redis/engine/redis.py`
+8. `src/mini_redis/storage/manager.py`
+9. `src/mini_redis/storage/ttl.py`
+10. `src/mini_redis/invalidation/manager.py`
+11. `src/mini_redis/persistence/manager.py`
+12. `src/mini_redis/storage/mongo_manager.py`
 
-현재 테스트 범위:
+## Supported Runtime Pieces
 
-- CLI parser / CLI output / WATCH / LIVESET
+현재 코드 기준으로 눈여겨볼 기능은 아래와 같습니다.
+
+- CLI client with local helper commands
+- TCP client/server transport
 - RESP codec
-- TCP round-trip / multiline RESP / persistent server connection
-- FIFO command execution
-- incremental rehash storage
-- TTL
-- command flow
-- inspect / probe / benchmark
-- persistence / restore / repair
-- Mongo integration boundary
+- FIFO command execution queue
+- command-specific handlers
+- in-memory hash table with incremental rehashing
+- TTL / expiration
+- tag-based invalidation
+- AOF / snapshot persistence and recovery
+- optional Mongo integration
+- benchmark / inspect / probe diagnostics
 
-총 65개의 테스트 케이스가 존재합니다.
-
-## 10. Current Limits
-
-- Mongo 관련 모듈과 `INFO MONGO`는 구현되어 있습니다.
-- `BENCHMARK MONGO`, `BENCHMARK HYBRID` 는 Mongo integration이 활성화되어 있어야 동작합니다.
-- 하지만 현재 기본 Redis command flow에서 `SET`/`DELETE`가 자동으로 Mongo write-through 되지는 않습니다.
-- 따라서 Mongo는 현재 기준으로는 확장 가능한 연동 경계로 보는 것이 가장 정확합니다.
-
-## 11. Run
+## Run
 
 ### Windows PowerShell
 
@@ -269,6 +177,25 @@ mini-redis-server
 
 ```powershell
 .venv\Scripts\Activate.ps1
+mini-redis-cli
+```
+
+### Windows PowerShell with MongoDB enabled
+
+MongoDB를 같이 쓰려면 서버를 시작하기 전에 아래 환경변수를 설정하면 됩니다.
+
+```powershell
+$env:MINI_REDIS_MONGO_ENABLED = "1"
+$env:MINI_REDIS_MONGO_URI = "mongodb://127.0.0.1:27017"
+$env:MINI_REDIS_MONGO_DB = "mini_redis"
+$env:MINI_REDIS_MONGO_COLLECTION = "kv_store"
+$env:MINI_REDIS_MONGO_SERVER_SELECTION_TIMEOUT_MS = "2000"
+mini-redis-server
+```
+
+같은 세션에서 CLI를 열면 됩니다.
+
+```powershell
 mini-redis-cli
 ```
 
@@ -288,9 +215,38 @@ source .venv/bin/activate
 mini-redis-cli
 ```
 
-## 12. Data Files
+### macOS / Linux with MongoDB enabled
 
-실행 중 생성될 수 있는 파일:
+```bash
+export MINI_REDIS_MONGO_ENABLED=1
+export MINI_REDIS_MONGO_URI="mongodb://127.0.0.1:27017"
+export MINI_REDIS_MONGO_DB="mini_redis"
+export MINI_REDIS_MONGO_COLLECTION="kv_store"
+export MINI_REDIS_MONGO_SERVER_SELECTION_TIMEOUT_MS="2000"
+mini-redis-server
+```
+
+같은 셸에서 CLI를 실행하면 됩니다.
+
+```bash
+mini-redis-cli
+```
+
+### MongoDB environment variables
+
+- `MINI_REDIS_MONGO_ENABLED`: Mongo 연동 사용 여부. `1`, `true`, `yes`, `on`이면 활성화됩니다.
+- `MINI_REDIS_MONGO_URI`: MongoDB 연결 URI입니다.
+- `MINI_REDIS_MONGO_DB`: 사용할 데이터베이스 이름입니다.
+- `MINI_REDIS_MONGO_COLLECTION`: 사용할 컬렉션 이름입니다.
+- `MINI_REDIS_MONGO_SERVER_SELECTION_TIMEOUT_MS`: MongoDB 서버 선택 타임아웃(ms)입니다.
+
+## Test
+
+```powershell
+pytest
+```
+
+## Data Files Created At Runtime
 
 - `data/appendonly.aof`
 - `data/dump.rdb.json`
